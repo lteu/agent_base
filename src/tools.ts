@@ -1,0 +1,886 @@
+// 本地工具：让模型能真正在这台机器上干活（建文件、读文件、列目录、跑命令）。
+// 模型通过 function calling 请求这些工具，由本进程在本地执行后把结果回传。
+
+import { execFile } from 'node:child_process'
+import {
+  readFileSync,
+  writeFileSync,
+  mkdirSync,
+  readdirSync,
+  statSync,
+  type Dirent,
+} from 'node:fs'
+import { resolve, dirname, relative, sep } from 'node:path'
+import { loadSmtpConfig } from './config.js'
+import { sendMail, type Attachment } from './smtp.js'
+import { getQuotes, formatQuote } from './stocks.js'
+import { termOpen, termSend, termRead, termList, termKill } from './term.js'
+import type { ChatMessage } from './llm.js'
+import { PDFParse } from 'pdf-parse'
+import XLSX from 'xlsx'
+import JSZip from 'jszip'
+
+/** 执行工具时主进程注入的上下文：让 run_agent 这类工具能反过来调用模型。 */
+export type ToolContext = {
+  apiKey: string
+  model: string
+  baseURL: string
+  provider?: string
+  signal?: AbortSignal
+  /** 子 agent 递归深度，防止 run_agent 无限自我派生。 */
+  depth?: number
+}
+
+// 遍历/检索时跳过的目录，避免把 node_modules、.git 等翻个底朝天。
+const IGNORE_DIRS = new Set([
+  'node_modules', '.git', 'dist', 'build', '.next', 'out',
+  'coverage', '.cache', '.turbo', '.venv', '__pycache__',
+])
+
+// 邮件附件按扩展名猜 MIME 类型，猜不到就用通用二进制类型。
+const MIME_TYPES: Record<string, string> = {
+  pdf: 'application/pdf',
+  png: 'image/png',
+  jpg: 'image/jpeg',
+  jpeg: 'image/jpeg',
+  gif: 'image/gif',
+  txt: 'text/plain',
+  csv: 'text/csv',
+  json: 'application/json',
+  zip: 'application/zip',
+}
+function guessMime(path: string): string {
+  const ext = path.split('.').pop()?.toLowerCase() ?? ''
+  return MIME_TYPES[ext] ?? 'application/octet-stream'
+}
+
+/** 递归列出目录下所有文件的绝对路径（自动跳过 IGNORE_DIRS）。 */
+function* walkFiles(dir: string): Generator<string> {
+  let entries: Dirent[]
+  try {
+    entries = readdirSync(dir, { withFileTypes: true })
+  } catch {
+    return
+  }
+  for (const e of entries) {
+    const full = resolve(dir, e.name)
+    if (e.isDirectory()) {
+      if (IGNORE_DIRS.has(e.name)) continue
+      yield* walkFiles(full)
+    } else if (e.isFile()) {
+      yield full
+    }
+  }
+}
+
+/** 把 glob 模式（支持 ** / * / ? 以及字符类）编译成匹配「相对路径」的正则。 */
+function globToRegExp(glob: string): RegExp {
+  let re = ''
+  for (let i = 0; i < glob.length; i++) {
+    const c = glob[i]
+    if (c === '*') {
+      if (glob[i + 1] === '*') {
+        re += '.*' // ** 跨目录
+        i++
+        if (glob[i + 1] === '/') i++ // 顺带吃掉 **/ 的斜杠
+      } else {
+        re += '[^/]*' // * 不跨目录
+      }
+    } else if (c === '?') {
+      re += '[^/]'
+    } else if ('+.^$()|{}\\'.includes(c)) {
+      re += '\\' + c
+    } else {
+      re += c // 普通字符、/、[]（字符类）原样保留
+    }
+  }
+  return new RegExp('^' + re + '$')
+}
+
+// 发给模型的工具声明（OpenAI 兼容格式）。
+export const TOOL_SCHEMAS = [
+  {
+    type: 'function',
+    function: {
+      name: 'write_file',
+      description:
+        '在本地磁盘创建或覆盖一个文件（自动创建所需父目录）。用于「建文档/写文件」这类需求。',
+      parameters: {
+        type: 'object',
+        properties: {
+          path: { type: 'string', description: '文件路径，相对路径相对于当前工作目录' },
+          content: { type: 'string', description: '文件完整内容，可为空字符串' },
+        },
+        required: ['path', 'content'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'read_file',
+      description: '读取本地一个文本文件的内容。',
+      parameters: {
+        type: 'object',
+        properties: {
+          path: { type: 'string', description: '文件路径' },
+        },
+        required: ['path'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'excel_read',
+      description:
+        '读取本地 Excel 文件（.xlsx/.xls/.csv）内容，按工作表转成文本表格返回。用于「看看这份表格里有什么/汇总这份 Excel」这类需求。',
+      parameters: {
+        type: 'object',
+        properties: {
+          path: { type: 'string', description: '文件路径' },
+          sheet: { type: 'string', description: '只读取指定工作表名，默认读取全部工作表' },
+        },
+        required: ['path'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'pdf_read',
+      description:
+        '提取本地 PDF 文件的文本内容。用于「看看这份 PDF 写了什么/总结这份 PDF」这类需求。扫描版（图片）PDF 可能提取不到文字。',
+      parameters: {
+        type: 'object',
+        properties: {
+          path: { type: 'string', description: '文件路径' },
+        },
+        required: ['path'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'powerpoint_read',
+      description:
+        '提取本地 PowerPoint 文件（.pptx）每页幻灯片的文本内容。用于「看看这份 PPT 讲了什么」这类需求。不支持旧版二进制 .ppt。',
+      parameters: {
+        type: 'object',
+        properties: {
+          path: { type: 'string', description: '文件路径' },
+        },
+        required: ['path'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'list_dir',
+      description: '列出某个目录下的文件与子目录。',
+      parameters: {
+        type: 'object',
+        properties: {
+          path: { type: 'string', description: '目录路径，默认当前目录', default: '.' },
+        },
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'run_bash',
+      description:
+        '在本地 shell 执行一条命令并返回 stdout/stderr。用于建目录(mkdir)、移动、运行脚本等。',
+      parameters: {
+        type: 'object',
+        properties: {
+          command: { type: 'string', description: '要执行的 shell 命令' },
+          intent: {
+            type: 'string',
+            description:
+              '这条命令想达成什么，用一句简短中文说明（≤16 字），如「安装缺失依赖」「查看阶段四报错详情」。会显示给用户，让进度可读。',
+          },
+        },
+        required: ['command', 'intent'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'send_email',
+      description:
+        '通过已配置的 SMTP 邮箱发送一封邮件，可选带附件（如 PDF）。用于「发邮件/把结果邮件给我/把 PDF 发到邮箱」等需求。需先用 ai --set-smtp 配置发件邮箱。',
+      parameters: {
+        type: 'object',
+        properties: {
+          to: { type: 'string', description: '收件人邮箱；多个用英文逗号分隔' },
+          subject: { type: 'string', description: '邮件主题' },
+          body: { type: 'string', description: '邮件正文（纯文本）' },
+          attachment_path: {
+            type: 'string',
+            description: '可选：要附带发送的本地文件路径（如 PDF），多个用英文逗号分隔',
+          },
+        },
+        required: ['to', 'subject', 'body'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'stock_quote',
+      description:
+        '查询美股实时报价（数据来自 Yahoo Finance）。用于「某只股票多少钱/涨跌如何」这类需求。',
+      parameters: {
+        type: 'object',
+        properties: {
+          symbols: {
+            type: 'string',
+            description: '股票代码，多个用英文逗号分隔，如 AAPL,TSLA,NVDA',
+          },
+        },
+        required: ['symbols'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'edit_file',
+      description:
+        '对已存在文件做精确字符串替换（不重写整个文件）。改动现有代码/文档时优先用它。old_string 必须与文件内容逐字匹配；默认要求唯一匹配，replace_all=true 时替换全部。',
+      parameters: {
+        type: 'object',
+        properties: {
+          path: { type: 'string', description: '文件路径' },
+          old_string: { type: 'string', description: '要被替换的原文（含缩进，需逐字匹配）' },
+          new_string: { type: 'string', description: '替换后的新内容' },
+          replace_all: { type: 'boolean', description: '是否替换全部出现，默认 false' },
+        },
+        required: ['path', 'old_string', 'new_string'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'glob',
+      description:
+        '按通配模式查找文件，返回匹配的文件路径（按修改时间从新到旧）。支持 **（跨目录）、*、?。用于「找某类文件」这类需求。',
+      parameters: {
+        type: 'object',
+        properties: {
+          pattern: { type: 'string', description: '通配模式，如 **/*.ts、src/**/*.tsx' },
+          path: { type: 'string', description: '搜索根目录，默认当前目录' },
+        },
+        required: ['pattern'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'grep',
+      description:
+        '在文件内容里按正则搜索，返回命中的 文件:行号:内容。用于「在代码里找某个符号/字符串」这类需求。',
+      parameters: {
+        type: 'object',
+        properties: {
+          pattern: { type: 'string', description: '正则表达式（JS 语法）' },
+          path: { type: 'string', description: '搜索根目录或单个文件，默认当前目录' },
+          glob: { type: 'string', description: '只搜匹配此通配模式的文件，如 *.ts' },
+          ignore_case: { type: 'boolean', description: '忽略大小写，默认 false' },
+          max_results: { type: 'number', description: '最多返回多少行，默认 200' },
+        },
+        required: ['pattern'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'web_fetch',
+      description:
+        '抓取一个网页/接口的内容并返回文本（HTML 会被粗略转成纯文本）。用于「看看这个网址/查在线资料」这类需求。',
+      parameters: {
+        type: 'object',
+        properties: {
+          url: { type: 'string', description: '要抓取的 URL（http/https）' },
+          max_chars: { type: 'number', description: '返回正文最大字符数，默认 20000' },
+        },
+        required: ['url'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'run_agent',
+      description:
+        '派生一个子 agent 独立完成一项较复杂的子任务（它自带全套本地工具，会自己读写文件、跑命令、检索代码），完成后返回结果摘要。适合「调研/多步骤搜索」这类需要展开但你只想要结论的工作。',
+      parameters: {
+        type: 'object',
+        properties: {
+          description: { type: 'string', description: '子任务的简短描述（3-5 个词）' },
+          prompt: { type: 'string', description: '交给子 agent 的完整任务说明' },
+        },
+        required: ['description', 'prompt'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'skill',
+      description:
+        '读取一个已安装「技能」(skill) 的完整操作说明。系统提示里列出了可用技能的名字与用途；当用户需求匹配其中某个技能时，先用本工具按名字把手册取进上下文，再照其步骤执行。',
+      parameters: {
+        type: 'object',
+        properties: {
+          name: { type: 'string', description: '技能名（见系统提示中的技能清单）' },
+        },
+        required: ['name'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'term_open',
+      description:
+        '开一个「常驻终端会话」（基于 tmux），跨多轮对话存活。用于启动 claude code 等交互式/长跑程序——run_bash 是一次性、60 秒就超时、每次新 shell，撑不住这类场景，这时改用本工具。开好后用 term_read 看输出、term_send 发后续指令。',
+      parameters: {
+        type: 'object',
+        properties: {
+          name: { type: 'string', description: '会话名（自取，如 cc、build）。同名已存在则不重开。' },
+          command: { type: 'string', description: '可选：开好会话后立即在其中执行的命令，如 claude。留空则只开一个空 shell。' },
+        },
+        required: ['name'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'term_send',
+      description:
+        '向某个常驻终端会话发送输入（相当于在它键盘上打字）。默认把 input 当字面文本敲并补一个回车；要发控制键（如 C-c 中断、Up 上一条历史）时把 literal 设为 false。发完通常配合 term_read 看反应。',
+      parameters: {
+        type: 'object',
+        properties: {
+          name: { type: 'string', description: '会话名（term_open 时取的名字）' },
+          input: { type: 'string', description: '要发送的文本；literal=false 时是 tmux 键名，如 C-c、Up、Enter' },
+          enter: { type: 'boolean', description: '发完是否补一个回车，默认 true' },
+          literal: { type: 'boolean', description: 'true(默认)=按字面文本敲；false=按 tmux 键名敲（发控制键用）' },
+        },
+        required: ['name', 'input'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'term_read',
+      description:
+        '读取某个常驻终端会话的当前屏幕 + 最近若干行历史（纯文本），用于「查看执行日志/程序现在输出了什么」。程序输出有延迟时，可用 wait_ms 先等一会儿再抓。',
+      parameters: {
+        type: 'object',
+        properties: {
+          name: { type: 'string', description: '会话名' },
+          lines: { type: 'number', description: '往回取多少行历史，默认 200（上限 5000）' },
+          wait_ms: { type: 'number', description: '抓取前先等待的毫秒数，默认 0（上限 10000），给程序留出输出时间' },
+        },
+        required: ['name'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'term_list',
+      description: '列出当前所有常驻终端会话及其状态。',
+      parameters: { type: 'object', properties: {} },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'term_kill',
+      description: '结束一个常驻终端会话（会杀掉其中正在运行的程序）。',
+      parameters: {
+        type: 'object',
+        properties: {
+          name: { type: 'string', description: '会话名' },
+        },
+        required: ['name'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'screenshot',
+      description:
+        '截取 macOS 全屏截图（静默，无需人工确认）。返回截图文件路径。用于"截图/截屏/把屏幕发给我"等需求。参数 path 可选，默认保存到 /tmp/screenshot.png。注意：本工具已内置，切勿通过 run_bash 调 screencapture，后者可能触发交互式窗口选择而卡住。',
+      parameters: {
+        type: 'object',
+        properties: {
+          path: { type: 'string', description: '截图保存路径，默认 /tmp/screenshot.png' },
+        },
+      },
+    },
+  },
+] as const
+
+export type ToolCall = {
+  id: string
+  name: string
+  arguments: string // JSON 字符串
+}
+
+// 执行单个工具调用，返回给模型看的纯文本结果。
+// ctx 仅 run_agent 这类需要回调模型的工具用得到，其余工具忽略它。
+export async function runTool(
+  name: string,
+  args: Record<string, any>,
+  ctx?: ToolContext,
+): Promise<string> {
+  switch (name) {
+    case 'write_file': {
+      const path = resolve(String(args.path))
+      mkdirSync(dirname(path), { recursive: true })
+      writeFileSync(path, String(args.content ?? ''))
+      return `已写入 ${path}（${Buffer.byteLength(String(args.content ?? ''))} 字节）`
+    }
+    case 'read_file': {
+      const path = resolve(String(args.path))
+      const text = readFileSync(path, 'utf8')
+      return text.length > 20000 ? text.slice(0, 20000) + '\n…（已截断）' : text
+    }
+    case 'excel_read': {
+      const path = resolve(String(args.path))
+      const wb = XLSX.readFile(path)
+      const only = String(args.sheet ?? '').trim()
+      const names = only ? wb.SheetNames.filter(n => n === only) : wb.SheetNames
+      if (!names.length) {
+        return only
+          ? `未找到工作表「${only}」，可用工作表：${wb.SheetNames.join('、')}`
+          : '(工作簿无工作表)'
+      }
+      const text = names
+        .map(n => `# 工作表：${n}\n` + XLSX.utils.sheet_to_csv(wb.Sheets[n]))
+        .join('\n\n')
+      return text.length > 20000 ? text.slice(0, 20000) + '\n…（已截断）' : text
+    }
+    case 'pdf_read': {
+      const path = resolve(String(args.path))
+      const parser = new PDFParse({ data: readFileSync(path) })
+      try {
+        const result = await parser.getText()
+        const text = result.text.trim()
+        if (!text) return '(未提取到文本，可能是扫描版 PDF)'
+        return text.length > 20000 ? text.slice(0, 20000) + '\n…（已截断）' : text
+      } finally {
+        await parser.destroy()
+      }
+    }
+    case 'powerpoint_read': {
+      const path = resolve(String(args.path))
+      const zip = await JSZip.loadAsync(readFileSync(path))
+      const slideFiles = Object.keys(zip.files)
+        .filter(f => /^ppt\/slides\/slide\d+\.xml$/.test(f))
+        .sort((a, b) => {
+          const na = Number(a.match(/slide(\d+)\.xml$/)?.[1] ?? 0)
+          const nb = Number(b.match(/slide(\d+)\.xml$/)?.[1] ?? 0)
+          return na - nb
+        })
+      if (!slideFiles.length) return '(未找到幻灯片，请确认文件是 .pptx 格式)'
+      const decodeXmlEntities = (s: string) =>
+        s.replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&apos;/g, "'")
+      const parts: string[] = []
+      for (let i = 0; i < slideFiles.length; i++) {
+        const xml = await zip.files[slideFiles[i]].async('string')
+        const texts = [...xml.matchAll(/<a:t>([\s\S]*?)<\/a:t>/g)].map(m => decodeXmlEntities(m[1]))
+        parts.push(`# 幻灯片 ${i + 1}\n` + (texts.join('\n') || '(无文本)'))
+      }
+      const text = parts.join('\n\n')
+      return text.length > 20000 ? text.slice(0, 20000) + '\n…（已截断）' : text
+    }
+    case 'list_dir': {
+      const path = resolve(String(args.path ?? '.'))
+      const entries = readdirSync(path).map(name => {
+        const isDir = statSync(resolve(path, name)).isDirectory()
+        return isDir ? name + '/' : name
+      })
+      return entries.length ? entries.join('\n') : '(空目录)'
+    }
+    case 'run_bash': {
+      const command = String(args.command ?? '')
+      if (ctx?.signal?.aborted) return '（已中断，未执行）'
+      return await new Promise<string>(res => {
+        execFile(
+          '/bin/sh',
+          ['-c', command],
+          // 把 signal 传给 execFile：用户按 Esc/Ctrl+C 时 Node 会直接 kill 掉子进程（含其子孙），
+          // 否则长跑脚本（如 python 训练）会一直占着、loop 卡在 await 上，Esc 形同虚设。
+          { timeout: 60_000, maxBuffer: 10 * 1024 * 1024, signal: ctx?.signal, killSignal: 'SIGKILL' },
+          (err, stdout, stderr) => {
+            const out = [stdout, stderr].filter(Boolean).join('\n').trim()
+            // 被 Esc 中断（AbortError）：明确告知，别把它当成普通命令失败。
+            if (err && (err as any).name === 'AbortError') {
+              res(`命令已被用户中断${out ? `\n${out}` : ''}`)
+            } else if (err && (err as any).code !== 0) {
+              res(`命令退出码 ${(err as any).code ?? 1}\n${out || (err as Error).message}`)
+            } else {
+              res(out || '(无输出)')
+            }
+          },
+        )
+      })
+    }
+    case 'send_email': {
+      const smtp = loadSmtpConfig()
+      if (!smtp.user || !smtp.pass) {
+        return '未配置发件邮箱。先运行: ai --set-smtp <邮箱> <应用专用密码> [host] [port]'
+      }
+      const to = String(args.to ?? '')
+        .split(',')
+        .map(s => s.trim())
+        .filter(Boolean)
+      if (!to.length) return '收件人为空'
+      const attachmentPaths = String(args.attachment_path ?? '')
+        .split(',')
+        .map(s => s.trim())
+        .filter(Boolean)
+      let attachments: Attachment[] | undefined
+      if (attachmentPaths.length) {
+        try {
+          attachments = attachmentPaths.map(p => {
+            const full = resolve(p)
+            return { filename: full.split(sep).pop() || full, content: readFileSync(full), contentType: guessMime(full) }
+          })
+        } catch (e: any) {
+          return `附件读取失败: ${e?.message ?? String(e)}`
+        }
+      }
+      try {
+        const sent = await sendMail(
+          { host: smtp.host, port: smtp.port, secure: smtp.secure, user: smtp.user, pass: smtp.pass, from: smtp.from! },
+          { to, subject: String(args.subject ?? ''), text: String(args.body ?? ''), attachments },
+        )
+        return `邮件已发送给 ${sent.join(', ')}${attachments ? `（附件 ${attachments.length} 个）` : ''}`
+      } catch (e: any) {
+        return `发送失败: ${e?.message ?? String(e)}`
+      }
+    }
+    case 'stock_quote': {
+      const symbols = String(args.symbols ?? '')
+        .split(',')
+        .map(s => s.trim())
+        .filter(Boolean)
+      if (!symbols.length) return '未提供股票代码'
+      const results = await getQuotes(symbols)
+      return results
+        .map(r => (r.quote ? formatQuote(r.quote) : `${r.symbol}: ${r.error}`))
+        .join('\n')
+    }
+    case 'edit_file': {
+      const path = resolve(String(args.path))
+      const oldStr = String(args.old_string ?? '')
+      const newStr = String(args.new_string ?? '')
+      if (oldStr === newStr) return 'old_string 与 new_string 相同，无需修改'
+      const text = readFileSync(path, 'utf8')
+      const count = oldStr ? text.split(oldStr).length - 1 : 0
+      if (count === 0) return `未找到要替换的内容（old_string 在 ${path} 中不存在）`
+      if (count > 1 && !args.replace_all) {
+        return `old_string 在文件中出现 ${count} 次（不唯一）。请提供更多上下文使其唯一，或设 replace_all=true。`
+      }
+      const next = args.replace_all ? text.split(oldStr).join(newStr) : text.replace(oldStr, newStr)
+      writeFileSync(path, next)
+      return `已编辑 ${path}（替换 ${args.replace_all ? count : 1} 处）`
+    }
+    case 'glob': {
+      const root = resolve(String(args.path ?? '.'))
+      const re = globToRegExp(String(args.pattern ?? '*'))
+      const hits: { path: string; mtime: number }[] = []
+      for (const f of walkFiles(root)) {
+        const rel = relative(root, f).split(sep).join('/')
+        if (re.test(rel)) {
+          try {
+            hits.push({ path: f, mtime: statSync(f).mtimeMs })
+          } catch {
+            hits.push({ path: f, mtime: 0 })
+          }
+        }
+        if (hits.length > 1000) break
+      }
+      hits.sort((a, b) => b.mtime - a.mtime)
+      return hits.length ? hits.map(h => h.path).join('\n') : '(无匹配文件)'
+    }
+    case 'grep': {
+      const flags = 'g' + (args.ignore_case ? 'i' : '')
+      let re: RegExp
+      try {
+        re = new RegExp(String(args.pattern ?? ''), flags)
+      } catch (e: any) {
+        return `无效正则: ${e?.message ?? String(e)}`
+      }
+      const target = resolve(String(args.path ?? '.'))
+      const fileFilter = args.glob ? globToRegExp(String(args.glob)) : null
+      const max = Number(args.max_results) > 0 ? Number(args.max_results) : 200
+      let isFile = false
+      try {
+        isFile = statSync(target).isFile()
+      } catch {
+        return `路径不存在: ${target}`
+      }
+      const files = isFile ? [target] : [...walkFiles(target)]
+      const out: string[] = []
+      outer: for (const f of files) {
+        if (fileFilter) {
+          const rel = isFile ? f : relative(target, f).split(sep).join('/')
+          const base = f.split(sep).pop() ?? f
+          if (!fileFilter.test(rel) && !fileFilter.test(base)) continue
+        }
+        let text: string
+        try {
+          text = readFileSync(f, 'utf8')
+        } catch {
+          continue
+        }
+        if (text.includes(' ')) continue // 跳过二进制
+        const lines = text.split('\n')
+        for (let i = 0; i < lines.length; i++) {
+          re.lastIndex = 0
+          if (re.test(lines[i])) {
+            out.push(`${f}:${i + 1}:${lines[i].slice(0, 300)}`)
+            if (out.length >= max) break outer
+          }
+        }
+      }
+      return out.length ? out.join('\n') : '(无匹配)'
+    }
+    case 'web_fetch': {
+      const url = String(args.url ?? '')
+      if (!/^https?:\/\//i.test(url)) return 'url 必须以 http:// 或 https:// 开头'
+      const max = Number(args.max_chars) > 0 ? Number(args.max_chars) : 20000
+      try {
+        const res = await fetch(url, {
+          headers: { 'User-Agent': 'ai-cli/0.1 (+local agent)' },
+          signal: AbortSignal.timeout(30_000),
+        })
+        const ctype = res.headers.get('content-type') ?? ''
+        let body = await res.text()
+        if (ctype.includes('html')) {
+          body = body
+            .replace(/<script[\s\S]*?<\/script>/gi, '')
+            .replace(/<style[\s\S]*?<\/style>/gi, '')
+            .replace(/<[^>]+>/g, ' ')
+            .replace(/&nbsp;/g, ' ')
+            .replace(/&amp;/g, '&')
+            .replace(/&lt;/g, '<')
+            .replace(/&gt;/g, '>')
+            .replace(/[ \t]+/g, ' ')
+            .replace(/\n\s*\n\s*\n+/g, '\n\n')
+            .trim()
+        }
+        const head = `HTTP ${res.status} ${ctype}\n`
+        return head + (body.length > max ? body.slice(0, max) + '\n…（已截断）' : body)
+      } catch (e: any) {
+        return `抓取失败: ${e?.message ?? String(e)}`
+      }
+    }
+    case 'run_agent': {
+      if (!ctx) return '当前环境不支持子 agent（缺少模型上下文）'
+      if ((ctx.depth ?? 0) >= 2) return '子 agent 嵌套过深，已拒绝继续派生'
+      const { runAgent } = await import('./agent/engine.js')
+      const sys =
+        `你是被主 agent 派生的子 agent，需独立完成下面这项子任务，完成后用简洁中文汇报结论。` +
+        `当前工作目录 ${process.cwd()}。你具备全套本地工具（读写/编辑文件、列目录、执行命令、glob/grep 检索、抓网页等），需要时直接调用，不要拒绝本地操作。`
+      const history: ChatMessage[] = [
+        { role: 'system', content: sys },
+        { role: 'user', content: String(args.prompt ?? args.description ?? '') },
+      ]
+      const texts: string[] = []
+      for await (const ev of runAgent(history, {
+        apiKey: ctx.apiKey,
+        model: ctx.model,
+        baseURL: ctx.baseURL,
+        provider: ctx.provider,
+        signal: ctx.signal,
+        maxSteps: 15,
+        depth: (ctx.depth ?? 0) + 1,
+      })) {
+        if (ev.type === 'text' && ev.content) texts.push(ev.content)
+      }
+      return texts.join('\n').trim() || '(子 agent 无输出)'
+    }
+    case 'skill': {
+      const { readSkill } = await import('./skills.js')
+      const skillName = String(args.name ?? '').trim()
+      if (!skillName) return '未提供技能名'
+      const found = readSkill(skillName)
+      if (!found) return `未找到技能「${skillName}」。可用 ai --skills 查看已安装技能。`
+      const skillDir = dirname(found.meta.path)
+      return (
+        `# 技能：${found.meta.name}\n` +
+        `（技能目录：${skillDir}，正文里提到的脚本/资源可用相对路径在此目录下引用）\n\n` +
+        found.body
+      )
+    }
+    case 'term_open':
+      return await termOpen(String(args.name ?? ''), args.command != null ? String(args.command) : undefined)
+    case 'term_send':
+      return await termSend(
+        String(args.name ?? ''),
+        String(args.input ?? ''),
+        args.enter !== false,
+        args.literal !== false,
+      )
+    case 'term_read':
+      return await termRead(String(args.name ?? ''), Number(args.lines) || 200, Number(args.wait_ms) || 0)
+    case 'term_list':
+      return await termList()
+    case 'term_kill':
+      return await termKill(String(args.name ?? ''))
+    case 'screenshot': {
+      const dest = resolve(String(args.path || '/tmp/screenshot.png'))
+      const dir = dirname(dest)
+      try { mkdirSync(dir, { recursive: true }) } catch { /* 目录已存在则忽略 */ }
+      // -x 静默（不发声）、-C 连光标一起截（方便定位）、不传 -i/-w/-s/-W 等任何交互参数
+      return await new Promise<string>(res => {
+        execFile(
+          '/usr/sbin/screencapture',
+          ['-x', '-C', dest],
+          { timeout: 15_000, signal: ctx?.signal, killSignal: 'SIGKILL' },
+          (err, _stdout, stderr) => {
+            if (err && (err as any).name === 'AbortError') {
+              res('截图已中断')
+            } else if (err) {
+              const msg = stderr?.trim() || (err as Error).message
+              res(`截图失败 (退出码 ${(err as any).code ?? 1}): ${msg}`)
+            } else {
+              res(`截图已保存至 ${dest}`)
+            }
+          },
+        )
+      })
+    }
+    default:
+      return `未知工具: ${name}`
+  }
+}
+
+// 把命令裁到 max 字符，超出补省略号（让用户知道还有后续）。
+function clip(s: string, max: number): string {
+  s = s.trim()
+  return s.length > max ? s.slice(0, max - 1) + '…' : s
+}
+
+// 把 run_bash 命令渲染成命令标签：模型每次都在新 shell 里跑，习惯加 `cd <长路径> && 真命令` 前缀，
+// 直接截断会把所有行都截成同一段 cd、把真正干的事全切掉。这里把 cd 前缀剥成「目录名」标签，
+// 余下的真命令完整展示，让每一行都各有其义。分隔符 `&&`、`;`、换行都认（模型也常用换行串多条命令）。
+// 只返回命令部分，不含「运行」动词——动词留给 describeToolCall 按是否有 intent 决定。
+function bashLabel(raw: string): string {
+  const command = raw.trim()
+  // 匹配前导 `cd <路径>` + 分隔符（&&、; 或换行），路径支持引号包裹。
+  // 分隔符前只吃同行空白（[ \t]*），这样裸换行也能当分隔符，不会被 \s* 提前吞掉。
+  const m = command.match(/^cd\s+(?:'([^']*)'|"([^"]*)"|(\S+))[ \t]*(?:&&|;|\n)\s*([\s\S]+)$/)
+  if (m) {
+    const dir = (m[1] ?? m[2] ?? m[3] ?? '').replace(/\/+$/, '')
+    const base = dir.split('/').filter(Boolean).pop() || dir || '/'
+    // 余下若还是多行脚本，只取第一条有内容的命令，省略号示意还有后续。
+    const rest = m[4].split('\n').map(s => s.trim()).filter(Boolean)
+    const head = rest[0] + (rest.length > 1 ? ' …' : '')
+    return `[${base}] \`${clip(head, 72)}\``
+  }
+  // 纯 cd（没有后续命令）本身没什么信息量，直接说进了哪个目录。
+  const onlyCd = command.match(/^cd\s+(?:'([^']*)'|"([^"]*)"|(\S+))\s*$/)
+  if (onlyCd) {
+    const dir = (onlyCd[1] ?? onlyCd[2] ?? onlyCd[3] ?? '').replace(/\/+$/, '')
+    return `进入目录 ${dir.split('/').filter(Boolean).pop() || dir}`
+  }
+  return `\`${clip(command, 80)}\``
+}
+
+// 从工具结果里判断是否「失败」并提炼一句给用户看的原因；非失败返回 null。
+// 工具结果本来只回灌给模型，用户在终端只看到调用前的进度行，脚本一旦失败就只剩一片茫然。
+// 这里把失败原因捞出来，供 UI 紧跟在进度行后面显示。
+export function summarizeToolFailure(name: string, result: string): string | null {
+  const r = result.trim()
+  if (!r) return null
+  // run_bash：失败时是 `命令退出码 N\n<stdout+stderr>`，真正的原因一般在输出最后一行
+  // （Python traceback 的最后一行就是异常本身）。
+  const exit = r.match(/^命令退出码\s+(\S+)\n([\s\S]*)$/)
+  if (exit) {
+    const lines = exit[2].split('\n').map(s => s.trim()).filter(Boolean)
+    const reason = lines[lines.length - 1] ?? ''
+    return `退出码 ${exit[1]}` + (reason ? `：${clip(reason, 100)}` : '')
+  }
+  // execTool 捕获的抛错，以及各工具返回的软失败文案（取首行即可）。
+  if (/^错误[:：]/.test(r) || /^(发送失败|抓取失败|无效正则|未找到|路径不存在)/.test(r)) {
+    return clip(r.split('\n')[0], 120)
+  }
+  return null
+}
+
+// 给状态栏/历史显示用的一句话摘要。
+export function describeToolCall(name: string, args: Record<string, any>): string {
+  switch (name) {
+    case 'write_file':
+      return `写文件 ${args.path}`
+    case 'read_file':
+      return `读文件 ${args.path}`
+    case 'excel_read':
+      return `读表格 ${args.path}`
+    case 'pdf_read':
+      return `读 PDF ${args.path}`
+    case 'powerpoint_read':
+      return `读 PPT ${args.path}`
+    case 'list_dir':
+      return `列目录 ${args.path ?? '.'}`
+    case 'run_bash': {
+      // 模型用 intent 声明「这条命令想干嘛」，把它当成动词放命令前面，让进度行先说清意图。
+      const intent = String(args.intent ?? '').trim()
+      const label = bashLabel(String(args.command ?? ''))
+      if (label.startsWith('进入目录')) return label // 纯 cd 本身已自解释，无需再缀意图
+      return intent ? `${intent} · ${label}` : `运行 ${label}`
+    }
+    case 'send_email':
+      return `发邮件给 ${args.to}`
+    case 'send_image':
+      return `发图片 ${args.path}`
+    case 'send_file':
+      return `发文件 ${args.path}`
+    case 'stock_quote':
+      return `查行情 ${args.symbols}`
+    case 'edit_file':
+      return `编辑 ${args.path}`
+    case 'glob':
+      return `查找 ${args.pattern}`
+    case 'grep':
+      return `检索 /${String(args.pattern ?? '').slice(0, 60)}/`
+    case 'web_fetch':
+      return `抓取 ${args.url}`
+    case 'run_agent':
+      return `子 agent：${args.description ?? ''}`
+    case 'skill':
+      return `技能 ${args.name ?? ''}`
+    case 'term_open':
+      return args.command ? `开终端 ${args.name} ▶ ${clip(String(args.command), 40)}` : `开终端 ${args.name}`
+    case 'term_send':
+      return `→ 终端 ${args.name}: ${clip(String(args.input ?? ''), 40)}`
+    case 'term_read':
+      return `读终端 ${args.name}`
+    case 'term_list':
+      return '列出终端会话'
+    case 'term_kill':
+      return `结束终端 ${args.name}`
+    default:
+      return name
+  }
+}
