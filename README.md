@@ -40,7 +40,7 @@ npm config set strict-ssl false
 ### 3. 安装依赖
 
 ```bash
-cd ~/agent_biz
+cd ~/agent_base
 rm -rf node_modules dist   # 清理旧版本残留
 npm ci --omit=dev
 ```
